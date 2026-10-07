@@ -1,0 +1,74 @@
+# Temporary harness: prove the aarch64 (NEON) build matches x86_64.
+# Not intended for upstream. Runs on pushes to the arm-parity branch.
+name: ARM parity
+
+on:
+  push:
+    branches: [arm-parity]
+  workflow_dispatch:
+
+jobs:
+  run:
+    name: Run on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and install wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pytest
+          python -c "import bgbot_cpp, platform; print(platform.machine(), bgbot_cpp.__file__)"
+
+      - name: pytest
+        continue-on-error: true
+        run: python -m pytest tests -q -p no:cacheprovider --junitxml=out/pytest.xml --durations=15
+
+      - name: Raw outputs, full set at 1-ply and 2-ply
+        run: python scripts/arm_parity_dump.py --levels 1ply 2ply --out out
+
+      - name: Raw outputs, first 1200 positions at 3-ply
+        run: python scripts/arm_parity_dump.py --levels 3ply --limit 1200 --out out
+
+      - name: Money benchmark PR
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from benchmark_money import benchmark_pr, SageBot
+          n = os.cpu_count()
+          for level, max_seed in (("1ply", None), ("2ply", None), ("3ply", 20)):
+              label = f"sage_{level}"
+              r = benchmark_pr(SageBot(level, parallel_threads=1), n_threads=n,
+                               label=label, max_seed=max_seed, progress=False)
+              Path(f"data/money_benchmark/scores/{label}.pr.json").write_text(json.dumps(
+                  {k: r[k] for k in ("total_pr", "checker_pr", "cube_pr", "n_decisions")}))
+              print(level, r["total_pr"], r["checker_pr"], r["cube_pr"], r["n_decisions"])
+          PY
+          cp -r data/money_benchmark/scores out/scores
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parity-${{ runner.arch }}
+          path: out/
+
+  compare:
+    name: Compare x86_64 vs aarch64
+    needs: run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+      - run: python3 scripts/arm_parity_compare.py results/parity-X64 results/parity-ARM64
