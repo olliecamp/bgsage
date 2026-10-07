@@ -31,7 +31,7 @@ jobs:
 
       - name: pytest
         continue-on-error: true
-        run: python -m pytest tests -q -p no:cacheprovider --junitxml=out/pytest.xml --durations=15
+        run: python -m pytest tests -q -p no:cacheprovider --continue-on-collection-errors --junitxml=out/pytest.xml --durations=15
 
       - name: Raw outputs, full set at 1-ply and 2-ply
         run: python scripts/arm_parity_dump.py --levels 1ply 2ply --out out
