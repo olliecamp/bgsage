@@ -120,6 +120,65 @@ static inline __m256 sigmoid256_ps(__m256 x) {
 }
 #endif
 
+// NEON port of exp256_ps / sigmoid256_ps above: same constants, same operation
+// order, so aarch64 hidden activations match x86_64 rather than the LUT.
+#if defined(BGBOT_USE_NEON)
+static inline float32x4_t exp_f32x4(float32x4_t x) {
+    const float32x4_t one    = vdupq_n_f32(1.0f);
+    const float32x4_t half   = vdupq_n_f32(0.5f);
+    const float32x4_t exp_hi = vdupq_n_f32(88.3762626647949f);
+    const float32x4_t exp_lo = vdupq_n_f32(-88.3762626647949f);
+    const float32x4_t log2e  = vdupq_n_f32(1.44269504088896341f);
+    const float32x4_t c1     = vdupq_n_f32(0.693359375f);
+    const float32x4_t c2     = vdupq_n_f32(-2.12194440e-4f);
+    const float32x4_t p0     = vdupq_n_f32(1.9875691500E-4f);
+    const float32x4_t p1     = vdupq_n_f32(1.3981999507E-3f);
+    const float32x4_t p2     = vdupq_n_f32(8.3334519073E-3f);
+    const float32x4_t p3     = vdupq_n_f32(4.1665795894E-2f);
+    const float32x4_t p4     = vdupq_n_f32(1.6666665459E-1f);
+    const float32x4_t p5     = vdupq_n_f32(5.0000001201E-1f);
+
+    x = vminq_f32(x, exp_hi);
+    x = vmaxq_f32(x, exp_lo);
+
+    float32x4_t fx = vfmaq_f32(half, x, log2e);
+    fx = vrndmq_f32(fx);  // floor
+
+    float32x4_t tmp = vmulq_f32(fx, c1);
+    float32x4_t z   = vmulq_f32(fx, c2);
+    x = vsubq_f32(x, tmp);
+    x = vsubq_f32(x, z);
+    z = vmulq_f32(x, x);
+
+    float32x4_t y = vfmaq_f32(p1, p0, x);
+    y = vfmaq_f32(p2, y, x);
+    y = vfmaq_f32(p3, y, x);
+    y = vfmaq_f32(p4, y, x);
+    y = vfmaq_f32(p5, y, x);
+    y = vfmaq_f32(x, y, z);
+    y = vaddq_f32(y, one);
+
+    int32x4_t imm0 = vcvtq_s32_f32(fx);
+    imm0 = vaddq_s32(imm0, vdupq_n_s32(0x7f));
+    imm0 = vshlq_n_s32(imm0, 23);
+    return vmulq_f32(y, vreinterpretq_f32_s32(imm0));
+}
+
+static inline float32x4_t sigmoid_f32x4(float32x4_t x) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    return vdivq_f32(one, vaddq_f32(one, exp_f32x4(vnegq_f32(x))));
+}
+
+// Output-layer dot product for one output, reduced in the same order as the
+// AVX2 path (8 lanes as two quads, lo+hi then two pairwise adds).
+static inline float hsum_f32x8(float32x4_t lo, float32x4_t hi) {
+    float32x4_t s = vaddq_f32(lo, hi);
+    s = vpaddq_f32(s, s);
+    s = vpaddq_f32(s, s);
+    return vgetq_lane_f32(s, 0);
+}
+#endif
+
 // SIMD dot product: compute sum of a[i]*b[i] for i=0..n-1
 // Both a and b must be at least n floats. No alignment required.
 #ifdef _MSC_VER
@@ -344,6 +403,11 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward(const float* inputs) const 
             __m256 v = _mm256_loadu_ps(&hiddens[h]);
             _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
         }
+#elif defined(BGBOT_USE_NEON)
+        for (; h + 7 < nh; h += 8) {
+            vst1q_f32(&hiddens[h],     sigmoid_f32x4(vld1q_f32(&hiddens[h])));
+            vst1q_f32(&hiddens[h + 4], sigmoid_f32x4(vld1q_f32(&hiddens[h + 4])));
+        }
 #endif
         for (; h < nh; ++h) {
             hiddens[h] = fast_sigmoid(hiddens[h]);
@@ -393,6 +457,34 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward(const float* inputs) const 
         o2 += hsum(s2);
         o3 += hsum(s3);
         o4 += hsum(s4);
+        for (; h < nh; ++h) {
+            const float z = hiddens[h];
+            o0 += w0[h] * z;
+            o1 += w1[h] * z;
+            o2 += w2[h] * z;
+            o3 += w3[h] * z;
+            o4 += w4[h] * z;
+        }
+    }
+#elif defined(BGBOT_USE_NEON)
+    {
+        const float* ws[5] = {w0, w1, w2, w3, w4};
+        float32x4_t lo[5], hi[5];
+        for (int o = 0; o < 5; ++o) { lo[o] = vdupq_n_f32(0.0f); hi[o] = vdupq_n_f32(0.0f); }
+        int h = 0;
+        for (; h + 7 < nh; h += 8) {
+            const float32x4_t zl = vld1q_f32(&hiddens[h]);
+            const float32x4_t zh = vld1q_f32(&hiddens[h + 4]);
+            for (int o = 0; o < 5; ++o) {
+                lo[o] = vfmaq_f32(lo[o], vld1q_f32(&ws[o][h]), zl);
+                hi[o] = vfmaq_f32(hi[o], vld1q_f32(&ws[o][h + 4]), zh);
+            }
+        }
+        o0 += hsum_f32x8(lo[0], hi[0]);
+        o1 += hsum_f32x8(lo[1], hi[1]);
+        o2 += hsum_f32x8(lo[2], hi[2]);
+        o3 += hsum_f32x8(lo[3], hi[3]);
+        o4 += hsum_f32x8(lo[4], hi[4]);
         for (; h < nh; ++h) {
             const float z = hiddens[h];
             o0 += w0[h] * z;
@@ -540,6 +632,11 @@ void NeuralNetwork::forward_batch(
                 __m256 v = _mm256_loadu_ps(&hiddens[h]);
                 _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
             }
+#elif defined(BGBOT_USE_NEON)
+            for (; h + 7 < nh; h += 8) {
+                vst1q_f32(&hiddens[h],     sigmoid_f32x4(vld1q_f32(&hiddens[h])));
+                vst1q_f32(&hiddens[h + 4], sigmoid_f32x4(vld1q_f32(&hiddens[h + 4])));
+            }
 #endif
             for (; h < nh; ++h) {
                 hiddens[h] = fast_sigmoid(hiddens[h]);
@@ -588,6 +685,34 @@ void NeuralNetwork::forward_batch(
             o2 += hsum(s2);
             o3 += hsum(s3);
             o4 += hsum(s4);
+            for (; h < nh; ++h) {
+                const float z = hiddens[h];
+                o0 += w0[h] * z;
+                o1 += w1[h] * z;
+                o2 += w2[h] * z;
+                o3 += w3[h] * z;
+                o4 += w4[h] * z;
+            }
+        }
+#elif defined(BGBOT_USE_NEON)
+        {
+            const float* ws[5] = {w0, w1, w2, w3, w4};
+            float32x4_t lo[5], hi[5];
+            for (int o = 0; o < 5; ++o) { lo[o] = vdupq_n_f32(0.0f); hi[o] = vdupq_n_f32(0.0f); }
+            int h = 0;
+            for (; h + 7 < nh; h += 8) {
+                const float32x4_t zl = vld1q_f32(&hiddens[h]);
+                const float32x4_t zh = vld1q_f32(&hiddens[h + 4]);
+                for (int o = 0; o < 5; ++o) {
+                    lo[o] = vfmaq_f32(lo[o], vld1q_f32(&ws[o][h]), zl);
+                    hi[o] = vfmaq_f32(hi[o], vld1q_f32(&ws[o][h + 4]), zh);
+                }
+            }
+            o0 += hsum_f32x8(lo[0], hi[0]);
+            o1 += hsum_f32x8(lo[1], hi[1]);
+            o2 += hsum_f32x8(lo[2], hi[2]);
+            o3 += hsum_f32x8(lo[3], hi[3]);
+            o4 += hsum_f32x8(lo[4], hi[4]);
             for (; h < nh; ++h) {
                 const float z = hiddens[h];
                 o0 += w0[h] * z;
@@ -713,6 +838,11 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward_save_base(
             __m256 v = _mm256_loadu_ps(&hiddens[h]);
             _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
         }
+#elif defined(BGBOT_USE_NEON)
+        for (; h + 7 < nh; h += 8) {
+            vst1q_f32(&hiddens[h],     sigmoid_f32x4(vld1q_f32(&hiddens[h])));
+            vst1q_f32(&hiddens[h + 4], sigmoid_f32x4(vld1q_f32(&hiddens[h + 4])));
+        }
 #endif
         for (; h < nh; ++h) {
             hiddens[h] = fast_sigmoid(hiddens[h]);
@@ -761,6 +891,34 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward_save_base(
         o2 += hsum(s2);
         o3 += hsum(s3);
         o4 += hsum(s4);
+        for (; h < nh; ++h) {
+            const float z = hiddens[h];
+            o0 += w0[h] * z;
+            o1 += w1[h] * z;
+            o2 += w2[h] * z;
+            o3 += w3[h] * z;
+            o4 += w4[h] * z;
+        }
+    }
+#elif defined(BGBOT_USE_NEON)
+    {
+        const float* ws[5] = {w0, w1, w2, w3, w4};
+        float32x4_t lo[5], hi[5];
+        for (int o = 0; o < 5; ++o) { lo[o] = vdupq_n_f32(0.0f); hi[o] = vdupq_n_f32(0.0f); }
+        int h = 0;
+        for (; h + 7 < nh; h += 8) {
+            const float32x4_t zl = vld1q_f32(&hiddens[h]);
+            const float32x4_t zh = vld1q_f32(&hiddens[h + 4]);
+            for (int o = 0; o < 5; ++o) {
+                lo[o] = vfmaq_f32(lo[o], vld1q_f32(&ws[o][h]), zl);
+                hi[o] = vfmaq_f32(hi[o], vld1q_f32(&ws[o][h + 4]), zh);
+            }
+        }
+        o0 += hsum_f32x8(lo[0], hi[0]);
+        o1 += hsum_f32x8(lo[1], hi[1]);
+        o2 += hsum_f32x8(lo[2], hi[2]);
+        o3 += hsum_f32x8(lo[3], hi[3]);
+        o4 += hsum_f32x8(lo[4], hi[4]);
         for (; h < nh; ++h) {
             const float z = hiddens[h];
             o0 += w0[h] * z;
@@ -885,6 +1043,11 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward_from_base(
             __m256 v = _mm256_loadu_ps(&hiddens[h]);
             _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
         }
+#elif defined(BGBOT_USE_NEON)
+        for (; h + 7 < nh; h += 8) {
+            vst1q_f32(&hiddens[h],     sigmoid_f32x4(vld1q_f32(&hiddens[h])));
+            vst1q_f32(&hiddens[h + 4], sigmoid_f32x4(vld1q_f32(&hiddens[h + 4])));
+        }
 #endif
         for (; h < nh; ++h) {
             hiddens[h] = fast_sigmoid(hiddens[h]);
@@ -933,6 +1096,34 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward_from_base(
         o2 += hsum(s2);
         o3 += hsum(s3);
         o4 += hsum(s4);
+        for (; h < nh; ++h) {
+            const float z = hiddens[h];
+            o0 += w0[h] * z;
+            o1 += w1[h] * z;
+            o2 += w2[h] * z;
+            o3 += w3[h] * z;
+            o4 += w4[h] * z;
+        }
+    }
+#elif defined(BGBOT_USE_NEON)
+    {
+        const float* ws[5] = {w0, w1, w2, w3, w4};
+        float32x4_t lo[5], hi[5];
+        for (int o = 0; o < 5; ++o) { lo[o] = vdupq_n_f32(0.0f); hi[o] = vdupq_n_f32(0.0f); }
+        int h = 0;
+        for (; h + 7 < nh; h += 8) {
+            const float32x4_t zl = vld1q_f32(&hiddens[h]);
+            const float32x4_t zh = vld1q_f32(&hiddens[h + 4]);
+            for (int o = 0; o < 5; ++o) {
+                lo[o] = vfmaq_f32(lo[o], vld1q_f32(&ws[o][h]), zl);
+                hi[o] = vfmaq_f32(hi[o], vld1q_f32(&ws[o][h + 4]), zh);
+            }
+        }
+        o0 += hsum_f32x8(lo[0], hi[0]);
+        o1 += hsum_f32x8(lo[1], hi[1]);
+        o2 += hsum_f32x8(lo[2], hi[2]);
+        o3 += hsum_f32x8(lo[3], hi[3]);
+        o4 += hsum_f32x8(lo[4], hi[4]);
         for (; h < nh; ++h) {
             const float z = hiddens[h];
             o0 += w0[h] * z;
