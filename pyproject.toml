@@ -90,9 +90,14 @@ test-command = "python -c \"from bgsage import BgBotAnalyzer, STARTING_BOARD; a 
 
 [tool.cibuildwheel.linux]
 # manylinux_2_28 gives us GCC 12+ which supports -mavx2/-mfma out of the box.
-# The compiled binary requires AVX2 (Haswell+, 2013+).
+# The x86_64 binary requires AVX2 (Haswell+, 2013+); aarch64 uses NEON
+# (Graviton / AWS Lambda arm64). Wheels need glibc >= 2.28, so on Lambda use
+# the Python 3.12+ runtimes (Amazon Linux 2023), not the AL2-based ones.
 manylinux-x86_64-image = "manylinux_2_28"
-archs = ["x86_64"]
+manylinux-aarch64-image = "manylinux_2_28"
+# auto64 = the runner's native 64-bit arch: x86_64 on ubuntu-latest, aarch64
+# on ubuntu-24.04-arm (native runner, no QEMU emulation).
+archs = ["auto64"]
 
 [tool.cibuildwheel.macos]
 # Universal build: Intel (x86_64) and Apple Silicon (arm64).
